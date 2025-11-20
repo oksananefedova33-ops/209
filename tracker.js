@@ -1,118 +1,98 @@
 (function(){
-  'use strict';
-
-  // Read API and token from globals (set during export)
-  var API = (window.STATS_API || '/stats_track.php').replace(/\/+$/, '');
-  var TOKEN = window.STATS_TOKEN || 'default';
-
-  var sessionSent = false;
-
-  // Generate / read anonymous ids
-  function uuid() {
-    return (crypto && crypto.randomUUID) ? crypto.randomUUID() :
-      'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c){
-        var r = Math.random()*16|0, v = c=='x'?r:(r&0x3|0x8);
-        return v.toString(16);
-      });
-  }
-  function getUid() {
-    try {
-      var k = 'zb_uid_v1';
-      var v = localStorage.getItem(k);
-      if (!v) { v = uuid(); localStorage.setItem(k, v); }
-      return v;
-    } catch(e) {
-      return ''; // no localStorage
+    'use strict';
+    
+    let notifySettings = null;
+    let sessionSent = false;
+    
+    // Загружаем настройки
+    async function loadSettings() {
+        try {
+            const api = (window.TG_NOTIFY_API || '/tg_notify_track.php').replace(/\/+$/, '');
+            const response = await fetch(`${api}?action=getSettings`, { mode: 'cors', credentials: 'omit' });
+            const data = await response.json();
+            if (data && data.ok) {
+                notifySettings = data.settings;
+            }
+        } catch(e) {}
     }
-  }
-  function getSid() {
-    try {
-      var k='zb_sid_v1';
-      var v = sessionStorage.getItem(k);
-      if (!v) { v = uuid(); sessionStorage.setItem(k, v); }
-      return v;
-    } catch(e) { return ''; }
-  }
+    
+    // Отправляем событие
+    async function trackEvent(type, details = {}) {
+        if (!notifySettings) return;
 
-  function send(payload) {
-    var fd = new FormData();
-    fd.append('action', 'track');
-    fd.append('token', TOKEN);
-    for (var k in payload) { if (payload[k] != null) fd.append(k, String(payload[k])); }
+        // Проверяем включен ли нужный тип уведомлений
+        if (type === 'visit' && notifySettings.notify_visits !== '1') return;
+        if (type === 'download' && notifySettings.notify_downloads !== '1') return;
+        if (type === 'link' && notifySettings.notify_links !== '1') return;
 
-    // Prefer beacon for reliability on navigation
-    if (navigator.sendBeacon) {
-      try {
-        var u = API;
-        var blob = new Blob([new URLSearchParams(Array.from(fd)).toString()], {type:'application/x-www-form-urlencoded'});
-        navigator.sendBeacon(u, blob);
-        return;
-      } catch(e) {}
+        const fd = new FormData();
+        fd.append('action', 'track');
+        fd.append('type', type);
+        fd.append('url', window.location.href);
+        fd.append('page_title', document.title);
+        fd.append('referrer', document.referrer);
+        fd.append('domain', location.hostname); // ← домен экспорт‑сайта
+
+        // Добавляем детали события
+        for (let key in details) {
+            fd.append(key, details[key]);
+        }
+
+        try {
+            const api = (window.TG_NOTIFY_API || '/tg_notify_track.php').replace(/\/+$/, '');
+            await fetch(api, {
+                method: 'POST',
+                mode: 'cors',
+                credentials: 'omit',
+                body: fd
+            });
+        } catch(e) {}
     }
-    // Fallback
-    try {
-      fetch(API, { method:'POST', mode:'cors', credentials:'omit', body: fd });
-    } catch(e) {}
-  }
-
-  function basePayload() {
-    return {
-      type: 'visit',
-      domain: location.hostname.replace(/^www\./,''),
-      url: location.href,
-      referrer: document.referrer || '',
-      uid: getUid(),
-      sid: getSid(),
-      user_agent: navigator.userAgent,
-      page_title: document.title || ''
-    };
-  }
-
-  function trackVisitOncePerSession() {
-    if (!sessionSent) {
-      var p = basePayload();
-      p.type = 'visit';
-      send(p);
-      sessionSent = true;
+    
+    // Отслеживаем посещение
+    function trackVisit() {
+        if (!sessionSent) {
+            trackEvent('visit');
+            sessionSent = true;
+        }
     }
-  }
-
-  function trackFileButtons() {
-    document.addEventListener('click', function(e){
-      var a = e.target.closest('.el.filebtn a, .el.Filebtn a, .bf-filebtn');
-      if (!a) return;
-      var p = basePayload();
-      p.type = 'download';
-      p.file_name = a.getAttribute('download') || a.dataset.fileName || (a.href ? a.href.split('/').pop() : 'unknown');
-      p.file_url = a.href || '';
-      send(p);
-    }, true);
-  }
-
-  function trackLinkButtons() {
-    document.addEventListener('click', function(e){
-      var a = e.target.closest('.el.linkbtn a, .el.Linkbtn a, .bl-linkbtn');
-      if (!a) return;
-      var p = basePayload();
-      p.type = 'link';
-      p.link_url = a.href || '';
-      send(p);
-    }, true);
-  }
-
-  // Probe settings (optional)
-  fetch(API + '?action=getSettings', {mode:'cors', credentials:'omit'}).then(function(r){ return r.json(); })
-    .then(function(cfg){
-      // if server says disabled, abort
-      if (cfg && cfg.settings && cfg.settings.enabled === false) return;
-      trackVisitOncePerSession();
-      trackFileButtons();
-      trackLinkButtons();
-    }).catch(function(){
-      // Even if settings fetch fails, still try to track
-      trackVisitOncePerSession();
-      trackFileButtons();
-      trackLinkButtons();
+    
+    // Отслеживаем клики по кнопкам-файлам
+    function trackFileButtons() {
+        document.addEventListener('click', function(e) {
+            const fileBtn = e.target.closest('.el.filebtn a, .el.Filebtn a, .bf-filebtn');
+            if (fileBtn) {
+                const fileName = fileBtn.getAttribute('download') || fileBtn.dataset.fileName || 'unknown';
+                const fileUrl = fileBtn.href;
+                trackEvent('download', {
+                    file_name: fileName,
+                    file_url: fileUrl
+                });
+            }
+        });
+    }
+    
+    // Отслеживаем клики по кнопкам-ссылкам
+    function trackLinkButtons() {
+        document.addEventListener('click', function(e) {
+            const linkBtn = e.target.closest('.el.linkbtn a, .el.Linkbtn a, .bl-linkbtn');
+            if (linkBtn && linkBtn.href && linkBtn.href !== '#') {
+                const linkText = linkBtn.textContent.trim();
+                const linkUrl = linkBtn.href;
+                trackEvent('link', {
+                    link_text: linkText,
+                    link_url: linkUrl
+                });
+            }
+        });
+    }
+    
+    // Инициализация
+    loadSettings().then(() => {
+        if (notifySettings) {
+            trackVisit();
+            trackFileButtons();
+            trackLinkButtons();
+        }
     });
-
 })();
